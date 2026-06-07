@@ -1,0 +1,6 @@
+node_modules/
+.env
+run_*.csv
+contacts.csv
+run_log.csv
+.DS_Store

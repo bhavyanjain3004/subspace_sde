@@ -1,0 +1,12 @@
+{
+  "name": "outreach-pipeline",
+  "version": "1.0.0",
+  "description": "Automated B2B cold outreach pipeline",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
