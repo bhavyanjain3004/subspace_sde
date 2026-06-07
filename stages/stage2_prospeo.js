@@ -1,23 +1,28 @@
 const { PROSPEO_API_KEY } = require('../config');
+const { withRetry } = require('../utils/retry');
 const logger = require('../utils/logger');
 
 async function getContactsForDomain(domainObj) {
   const domain = domainObj.domain;
 
-  const response = await fetch('https://api.prospeo.io/domain-search', {
-    method: 'POST',
-    headers: {
-      'X-KEY': PROSPEO_API_KEY,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ domain, limit: 5 })
-  });
+  const fetchContacts = async () => {
+    const response = await fetch('https://api.prospeo.io/domain-search', {
+      method: 'POST',
+      headers: {
+        'X-KEY': PROSPEO_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ domain, limit: 5 })
+    });
 
-  if (!response.ok) {
-    throw new Error(`Prospeo API returned HTTP ${response.status}`);
-  }
+    if (!response.ok) {
+      throw new Error(`Prospeo API returned HTTP ${response.status}: ${response.statusText}`);
+    }
 
-  const data = await response.json();
+    return await response.json();
+  };
+
+  const data = await withRetry(fetchContacts, 3, 5000);
   if (!data || !data.response || !data.response.email_list) {
     return [];
   }
