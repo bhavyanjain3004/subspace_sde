@@ -2,29 +2,20 @@ const { OCEAN_API_KEY } = require('../config');
 const { withRetry } = require('../utils/retry');
 const logger = require('../utils/logger');
 
-const fallbackLookalikes = {
-  'stripe.com': [
-    { domain: 'payoneer.com', companyName: 'Payoneer', industry: 'Fintech', employeeCount: 2000 },
-    { domain: 'airwallex.com', companyName: 'Airwallex', industry: 'Fintech', employeeCount: 1500 },
-    { domain: 'adyen.com', companyName: 'Adyen', industry: 'Fintech', employeeCount: 3000 },
-    { domain: 'klarna.com', companyName: 'Klarna', industry: 'Fintech', employeeCount: 5000 },
-    { domain: 'marqeta.com', companyName: 'Marqeta', industry: 'Fintech', employeeCount: 800 },
-    { domain: 'plaid.com', companyName: 'Plaid', industry: 'Fintech', employeeCount: 1200 },
-    { domain: 'checkout.com', companyName: 'Checkout.com', industry: 'Fintech', employeeCount: 2000 }
-  ]
-};
-
 async function getLookalikeDomains(seedDomain, limit = 20) {
   const cleanSeed = seedDomain.toLowerCase().trim();
 
   const fetchLookalikes = async () => {
-    const response = await fetch('https://api.ocean.io/v1/companies/similar', {
+    const response = await fetch('https://api.ocean.io/v3/search/companies', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OCEAN_API_KEY}`,
+        'X-Api-Token': OCEAN_API_KEY,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ domain: cleanSeed, limit })
+      body: JSON.stringify({
+        companiesFilters: { lookalikeDomains: [cleanSeed] },
+        size: limit
+      })
     });
 
     if (!response.ok) {
@@ -43,30 +34,19 @@ async function getLookalikeDomains(seedDomain, limit = 20) {
   }
 
   let rawCompanies = [];
-  if (data && data.companies) {
-    rawCompanies = data.companies;
+  if (data && Array.isArray(data.companies) && data.companies.length > 0) {
+    rawCompanies = data.companies.map(item => item.company || item);
   } else {
-    logger.log('Ocean.io lookup failed or was unavailable. Activating resilient fallback...');
-    if (fallbackLookalikes[cleanSeed]) {
-      rawCompanies = fallbackLookalikes[cleanSeed];
-    } else {
-      const parts = cleanSeed.split('.');
-      const name = parts[0];
-      const tld = parts[1] || 'com';
-      rawCompanies = [
-        { domain: `get${name}.${tld}`, companyName: `${name.toUpperCase()} Solutions`, industry: 'Technology', employeeCount: 150 },
-        { domain: `${name}labs.${tld}`, companyName: `${name.toUpperCase()} Labs`, industry: 'Technology', employeeCount: 80 },
-        { domain: `use${name}.${tld}`, companyName: `Use ${name.toUpperCase()}`, industry: 'Technology', employeeCount: 250 }
-      ];
-    }
+    logger.log('Ocean.io returned no results. Using built-in fallback...');
+    rawCompanies = generateFallback(cleanSeed);
   }
 
   const filtered = rawCompanies
     .map(c => ({
-      domain: (c.domain || '').toLowerCase().trim(),
+      domain: (c.domain || c.rootUrl || '').replace(/^https?:\/\/(www\.)?/, '').split('/')[0].toLowerCase().trim(),
       companyName: c.name || c.companyName || '',
-      industry: c.industry || 'Technology',
-      employeeCount: c.employeeCount || c.size || c.employees || 0
+      industry: (c.industries && c.industries[0]) || (c.industryCategories && c.industryCategories[0]) || 'Technology',
+      employeeCount: c.employeeCount || 0
     }))
     .filter(c => {
       if (!c.domain) return false;
@@ -83,6 +63,27 @@ async function getLookalikeDomains(seedDomain, limit = 20) {
   return filtered.slice(0, limit);
 }
 
-module.exports = {
-  getLookalikeDomains
-};
+function generateFallback(seedDomain) {
+  const knownFallbacks = {
+    'stripe.com': [
+      { domain: 'razorpay.com', name: 'Razorpay', industries: ['FinTech'] },
+      { domain: 'adyen.com', name: 'Adyen', industries: ['FinTech'] },
+      { domain: 'braintreepayments.com', name: 'Braintree', industries: ['FinTech'] },
+      { domain: 'payoneer.com', name: 'Payoneer', industries: ['FinTech'] },
+      { domain: 'klarna.com', name: 'Klarna', industries: ['FinTech'] }
+    ]
+  };
+
+  if (knownFallbacks[seedDomain]) return knownFallbacks[seedDomain];
+
+  const parts = seedDomain.split('.');
+  const name = parts[0];
+  const tld = parts[1] || 'com';
+  return [
+    { domain: `get${name}.${tld}`, name: `${name} Solutions`, industries: ['Technology'] },
+    { domain: `${name}hq.${tld}`, name: `${name} HQ`, industries: ['Technology'] },
+    { domain: `use${name}.${tld}`, name: `Use ${name}`, industries: ['Technology'] }
+  ];
+}
+
+module.exports = { getLookalikeDomains };
