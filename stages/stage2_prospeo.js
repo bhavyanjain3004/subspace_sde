@@ -1,9 +1,15 @@
 const { PROSPEO_API_KEY } = require('../config');
-const { withRetry } = require('../utils/retry');
 const logger = require('../utils/logger');
 
+const BASE = 'https://api.prospeo.io';
+const HEADERS = { 'X-KEY': PROSPEO_API_KEY, 'Content-Type': 'application/json' };
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 function getSeniorityScore(title) {
-  const t = title.toLowerCase();
+  const t = (title || '').toLowerCase();
   if (/\b(ceo|founder|co-founder)\b/.test(t)) return 1;
   if (/\b(cto|cmo|cfo|cpo|cro)\b/.test(t)) return 2;
   if (/\bvp\b|\bvice president\b/.test(t)) return 3;
@@ -12,81 +18,120 @@ function getSeniorityScore(title) {
   return 6;
 }
 
-async function getContactsForDomain(domainObj) {
-  const domain = domainObj.domain;
-  const industry = domainObj.industry;
-
-  const fetchContacts = async () => {
-    const response = await fetch('https://api.prospeo.io/domain-search', {
-      method: 'POST',
-      headers: {
-        'X-KEY': PROSPEO_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ domain, limit: 5 })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Prospeo API returned HTTP ${response.status}: ${response.statusText}`);
+async function searchPeopleForDomain(domain) {
+  const body = {
+    page: 1,
+    filters: {
+      company: {
+        websites: { include: [domain] }
+      }
     }
-
-    return await response.json();
   };
 
-  const data = await withRetry(fetchContacts, 3, 5000);
-  if (!data || !data.response || !data.response.email_list) {
+  const res = await fetch(`${BASE}/search-person`, {
+    method: 'POST',
+    headers: HEADERS,
+    body: JSON.stringify(body)
+  });
+
+  const data = await res.json();
+
+  if (data.error) {
+    throw new Error(`search-person failed: ${JSON.stringify(data)}`);
+  }
+
+  return data.results || [];
+}
+
+async function enrichPerson(firstName, lastName, companyWebsite) {
+  const body = {
+    data: {
+      first_name: firstName,
+      last_name: lastName,
+      company_website: companyWebsite
+    }
+  };
+
+  const res = await fetch(`${BASE}/enrich-person`, {
+    method: 'POST',
+    headers: HEADERS,
+    body: JSON.stringify(body)
+  });
+
+  const data = await res.json();
+
+  if (data.error) return null;
+  return data.person || null;
+}
+
+async function getContactsForDomain(domainObj, maxPerDomain = 2) {
+  const { domain, industry, companyName } = domainObj;
+
+  let results;
+  try {
+    results = await searchPeopleForDomain(domain);
+  } catch (err) {
+    logger.error(`search-person failed for ${domain}: ${err.message}`);
     return [];
   }
 
-  const emails = data.response.email_list;
+  if (!results.length) return [];
+
+  const ranked = results
+    .map(r => {
+      const p = r.person || r;
+      const score = getSeniorityScore(p.current_job_title);
+      return { ...p, seniorityScore: score };
+    })
+    .filter(p => p.seniorityScore <= 5)
+    .sort((a, b) => a.seniorityScore - b.seniorityScore)
+    .slice(0, maxPerDomain);
+
   const contacts = [];
 
-  for (const c of emails) {
-    if (!c.email) continue;
+  for (const p of ranked) {
+    const firstName = p.first_name || '';
+    const lastName = p.last_name || '';
 
-    const title = c.title || '';
-    const score = getSeniorityScore(title);
-    if (score === 6) continue; // Filter out junior roles
+    if (!firstName) continue;
 
-    let firstName = '';
-    let lastName = '';
-    let fullName = '';
+    await sleep(3500);
 
-    if (c.name) {
-      if (typeof c.name === 'object') {
-        firstName = c.name.first_name || '';
-        lastName = c.name.last_name || '';
-        fullName = c.name.full_name || `${firstName} ${lastName}`.trim();
-      } else if (typeof c.name === 'string') {
-        fullName = c.name;
-        const parts = c.name.split(' ');
-        firstName = parts[0] || '';
-        lastName = parts.slice(1).join(' ') || '';
-      }
-    } else {
-      firstName = c.first_name || '';
-      lastName = c.last_name || '';
-      fullName = c.full_name || `${firstName} ${lastName}`.trim();
+    let emailStr = null;
+
+    const enriched = await enrichPerson(firstName, lastName, domain);
+    if (
+      enriched &&
+      enriched.email &&
+      enriched.email.revealed === true &&
+      enriched.email.status === 'VERIFIED' &&
+      enriched.email.email
+    ) {
+      emailStr = enriched.email.email;
     }
 
-    const companyName = c.company && c.company.name ? c.company.name : domainObj.companyName;
+    if (!emailStr) {
+      logger.log(`No verified email for ${firstName} ${lastName} @ ${domain}`);
+      continue;
+    }
 
     contacts.push({
       firstName: firstName || 'there',
       lastName,
-      fullName: fullName || 'Contact',
-      title,
-      email: c.email.toLowerCase().trim(),
-      linkedinUrl: c.linkedin || c.linkedin_url || '',
-      company: companyName,
+      fullName: p.full_name || `${firstName} ${lastName}`.trim(),
+      title: p.current_job_title || '',
+      email: emailStr.toLowerCase().trim(),
+      linkedinUrl: p.linkedin_url || '',
+      company: companyName || domain,
       domain,
       industry,
-      seniorityScore: score
+      seniorityScore: p.seniorityScore
     });
+
+    logger.success(`Got contact: ${firstName} ${lastName} <${emailStr}> (${p.current_job_title})`);
   }
 
-  contacts.sort((a, b) => a.seniorityScore - b.seniorityScore);
-  return contacts.slice(0, 2);
+  return contacts;
 }
 
 async function getContacts(domains) {
@@ -100,14 +145,15 @@ async function getContacts(domains) {
         logger.success(`Found ${domainContacts.length} contact(s) for ${domainObj.domain}`);
         allContacts.push(...domainContacts);
       } else {
-        logger.log(`No decision-maker contacts found for ${domainObj.domain}`);
+        logger.log(`No contacts with email found for ${domainObj.domain}`);
       }
     } catch (err) {
-      logger.error(`Error querying domain ${domainObj.domain}: ${err.message}`);
+      logger.error(`Error for ${domainObj.domain}: ${err.message}`);
     }
+
+    await sleep(15000);
   }
 
-  // Deduplicate by email address
   const uniqueContacts = [];
   const seenEmails = new Set();
 
@@ -122,6 +168,4 @@ async function getContacts(domains) {
   return uniqueContacts;
 }
 
-module.exports = {
-  getContacts
-};
+module.exports = { getContacts };
