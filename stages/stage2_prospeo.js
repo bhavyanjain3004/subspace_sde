@@ -1,131 +1,127 @@
-const { OCEAN_API_KEY, PROSPEO_API_KEY } = require('../config');
+const { PROSPEO_API_KEY } = require('../config');
 const { withRetry } = require('../utils/retry');
 const logger = require('../utils/logger');
 
-const SENIOR_TITLES = ['ceo', 'founder', 'co-founder', 'cto', 'cmo', 'cfo', 'cpo', 'cro', 'vp ', 'vice president', 'head of', 'director'];
-
-function isSenior(person) {
-  const title = (person.jobTitle || '').toLowerCase();
-  const seniorities = (person.seniorities || []).map(s => s.toLowerCase());
-  if (seniorities.some(s => s.includes('c-level') || s.includes('founder') || s.includes('vp') || s.includes('director'))) return true;
-  return SENIOR_TITLES.some(t => title.includes(t));
+function getSeniorityScore(title) {
+  const t = title.toLowerCase();
+  if (/\b(ceo|founder|co-founder)\b/.test(t)) return 1;
+  if (/\b(cto|cmo|cfo|cpo|cro)\b/.test(t)) return 2;
+  if (/\bvp\b|\bvice president\b/.test(t)) return 3;
+  if (/\bhead of\b/.test(t)) return 4;
+  if (/\bdirector\b/.test(t)) return 5;
+  return 6;
 }
 
-async function getPeopleFromOcean(seedDomain, limit) {
-  const response = await fetch('https://api.ocean.io/v3/search/people', {
-    method: 'POST',
-    headers: {
-      'X-Api-Token': OCEAN_API_KEY,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      companiesFilters: { lookalikeDomains: [seedDomain] },
-      size: limit
-    })
-  });
+async function getContactsForDomain(domainObj) {
+  const domain = domainObj.domain;
+  const industry = domainObj.industry;
 
-  if (!response.ok) {
-    throw new Error(`Ocean.io people API returned HTTP ${response.status}`);
-  }
+  const fetchContacts = async () => {
+    const response = await fetch('https://api.prospeo.io/domain-search', {
+      method: 'POST',
+      headers: {
+        'X-KEY': PROSPEO_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ domain, limit: 5 })
+    });
 
-  const data = await response.json();
-  return data.people || [];
-}
-
-async function enrichEmail(person, companyDomain) {
-  const payload = {
-    data: {
-      first_name: person.firstName,
-      last_name: person.lastName,
-      company_website: companyDomain
+    if (!response.ok) {
+      throw new Error(`Prospeo API returned HTTP ${response.status}: ${response.statusText}`);
     }
+
+    return await response.json();
   };
 
-  const response = await fetch('https://api.prospeo.io/enrich-person', {
-    method: 'POST',
-    headers: {
-      'X-KEY': PROSPEO_API_KEY,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Prospeo API returned HTTP ${response.status}`);
-  }
-
-  const data = await response.json();
-  if (data.error) return null;
-
-  const r = data.response || {};
-  return r.email || null;
-}
-
-async function getContacts(domains, seedDomain) {
-  const seed = seedDomain || (domains[0] && domains[0].domain) || 'stripe.com';
-  logger.log(`Discovering senior contacts via Ocean.io + Prospeo...`);
-
-  let rawPeople = [];
-  try {
-    rawPeople = await withRetry(() => getPeopleFromOcean(seed, 30), 2, 3000);
-  } catch (err) {
-    logger.error(`Ocean.io people search failed: ${err.message}`);
+  const data = await withRetry(fetchContacts, 3, 5000);
+  if (!data || !data.response || !data.response.email_list) {
     return [];
   }
 
-  const seniorPeople = rawPeople.filter(isSenior);
-  logger.log(`Found ${seniorPeople.length} senior people out of ${rawPeople.length} total`);
+  const emails = data.response.email_list;
+  const contacts = [];
 
-  const allContacts = [];
-  const seenEmails = new Set();
-  const domainSet = new Set(domains.map(d => d.domain));
+  for (const c of emails) {
+    if (!c.email) continue;
 
-  for (const person of seniorPeople) {
-    const companyDomain = person.domain;
-    if (!domainSet.has(companyDomain)) continue;
+    const title = c.title || '';
+    const score = getSeniorityScore(title);
+    if (score === 6) continue; // Filter out junior roles
 
-    const companyObj = domains.find(d => d.domain === companyDomain) || {};
-    const companyName = (person.company && person.company.name) || companyObj.companyName || companyDomain;
-    const industry = companyObj.industry || 'Technology';
+    let firstName = '';
+    let lastName = '';
+    let fullName = '';
 
-    let email = null;
-    try {
-      email = await enrichEmail(person, companyDomain);
-      await new Promise(r => setTimeout(r, 1500));
-    } catch (err) {
-      logger.log(`Prospeo enrich failed for ${person.name}: ${err.message}`);
+    if (c.name) {
+      if (typeof c.name === 'object') {
+        firstName = c.name.first_name || '';
+        lastName = c.name.last_name || '';
+        fullName = c.name.full_name || `${firstName} ${lastName}`.trim();
+      } else if (typeof c.name === 'string') {
+        fullName = c.name;
+        const parts = c.name.split(' ');
+        firstName = parts[0] || '';
+        lastName = parts.slice(1).join(' ') || '';
+      }
+    } else {
+      firstName = c.first_name || '';
+      lastName = c.last_name || '';
+      fullName = c.full_name || `${firstName} ${lastName}`.trim();
     }
 
-    if (!email) {
-      logger.log(`No email for ${person.name} (${companyDomain})`);
-      continue;
-    }
+    const companyName = c.company && c.company.name ? c.company.name : domainObj.companyName;
 
-    if (seenEmails.has(email)) continue;
-    seenEmails.add(email);
-
-    const firstName = person.firstName || (person.name || '').split(' ')[0] || 'there';
-    const lastName = person.lastName || (person.name || '').split(' ').slice(1).join(' ') || '';
-
-    allContacts.push({
-      firstName,
+    contacts.push({
+      firstName: firstName || 'there',
       lastName,
-      fullName: person.name || `${firstName} ${lastName}`.trim(),
-      title: person.jobTitle || '',
-      email,
-      linkedinUrl: person.linkedinUrl || '',
+      fullName: fullName || 'Contact',
+      title,
+      email: c.email.toLowerCase().trim(),
+      linkedinUrl: c.linkedin || c.linkedin_url || '',
       company: companyName,
-      domain: companyDomain,
-      industry
+      domain,
+      industry,
+      seniorityScore: score
     });
-
-    logger.success(`Found ${person.name} <${email}> at ${companyDomain}`);
-
-    if (allContacts.length >= 20) break;
   }
 
-  logger.success(`Discovered ${allContacts.length} contacts with verified emails`);
-  return allContacts;
+  contacts.sort((a, b) => a.seniorityScore - b.seniorityScore);
+  return contacts.slice(0, 2);
 }
 
-module.exports = { getContacts };
+async function getContacts(domains) {
+  logger.log(`Discovering contacts across ${domains.length} domains...`);
+  const allContacts = [];
+
+  for (const domainObj of domains) {
+    try {
+      const domainContacts = await getContactsForDomain(domainObj);
+      if (domainContacts.length > 0) {
+        logger.success(`Found ${domainContacts.length} contact(s) for ${domainObj.domain}`);
+        allContacts.push(...domainContacts);
+      } else {
+        logger.log(`No decision-maker contacts found for ${domainObj.domain}`);
+      }
+    } catch (err) {
+      logger.error(`Error querying domain ${domainObj.domain}: ${err.message}`);
+    }
+  }
+
+  // Deduplicate by email address
+  const uniqueContacts = [];
+  const seenEmails = new Set();
+
+  for (const c of allContacts) {
+    if (!seenEmails.has(c.email)) {
+      seenEmails.add(c.email);
+      uniqueContacts.push(c);
+    }
+  }
+
+  logger.success(`Discovered ${allContacts.length} raw contacts, deduplicated to ${uniqueContacts.length} unique decision-makers`);
+  return uniqueContacts;
+}
+
+module.exports = {
+  getContacts
+};
